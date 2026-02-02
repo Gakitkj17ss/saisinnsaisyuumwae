@@ -156,10 +156,10 @@ class LipReadingTrainer:
         confusion_matrix_interval: int = 10,
         mode: str = "consonant",
         use_softper: bool = True,
+        ctc_weight: float = 1.0,
         lambda_softper: float = 0.1,
         softper_tau: float = 0.1,
         separate_softper_loss: bool = True,
-        ctc_weight: float = 1.0
     ):
         self.mode = mode
         self.model = model.to(device)
@@ -186,34 +186,21 @@ class LipReadingTrainer:
             )
             print("✓ Using standard CTC Loss")
 
-                # =========================
-        # Loss settings (CTC / SoftPER switchable)
-        # =========================
+        # ===== SoftPER Loss =====
         self.use_softper = bool(use_softper)
-        self.separate_softper_loss = bool(separate_softper_loss)  # ← これを追加
-        self.lambda_softper = float(lambda_softper)  # ← これも念のため
-        self.softper_tau = float(softper_tau)  # ← これも念のため
-
-        # --- CTC loss (always available) ---
-        self.ctc_loss = LengthAwareCTCLoss(
-            blank=phoneme_encoder.blank_id,
-            zero_infinity=True
-        )
-
-        # --- SoftPER loss (optional) ---
+        self.ctc_weight = float(ctc_weight)
+        self.lambda_softper = float(lambda_softper)
+        self.separate_softper_loss = bool(separate_softper_loss) 
+        
         if self.use_softper:
-            self.softper_loss = SoftPERLoss(
-                blank_id=self.phoneme_encoder.blank_id,
+            self.softper = SoftPERLoss(
+                blank_id=self.phoneme_encoder.blank_id, 
                 tau=float(softper_tau)
             ).to(self.device)
-            self.primary_loss = self.softper_loss
-            print(f"✓ Using SoftPER Loss (tau={softper_tau})")
+            print(f"✓ Using SoftPER Loss (lambda={self.lambda_softper}, tau={softper_tau})")
         else:
-            self.softper_loss = None
-            self.primary_loss = self.ctc_loss
-            print("✓ Using CTC Loss")
-
-
+            self.softper = None
+            print("✓ SoftPER Loss disabled")
                 # 最適化・スケジューラ・AMP
         self.optimizer = None
         self.scheduler = None
@@ -370,7 +357,6 @@ class LipReadingTrainer:
                 self.optimizer, mode='min',
                 factor=kwargs.get('factor', 0.5),
                 patience=kwargs.get('patience', 10),
-                
             )
         elif st == 'cosine':
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -393,40 +379,34 @@ class LipReadingTrainer:
     # ----------------------------
     def _filter_valid_batch(self, batch):
         """
-        tlen==0 や ilen==0 を除外し、CTC/SoftPER用に target を再構成。
+        tlen==0 や ilen==0 を除外し、CTC用に target を再構成。
         返り値: (x, y, ilen, tlen) or None
         """
-        # まず全部同じdeviceへ（ここが最重要）
-        x = batch['video'].to(self.device, non_blocking=True)       # (B,T,1,64,64)
-        y_cat = batch['target'].to(self.device, non_blocking=True)  # (sum_L,)
-        ilen = batch['input_length'].to(self.device)                # (B,)
-        tlen = batch['target_length'].to(self.device)               # (B,)
+        x = batch['video'].to(self.device)        # (B,T,1,64,64)
+        y_cat = batch['target']                   # (sum_L,)
+        ilen = batch['input_length']              # (B,)
+        tlen = batch['target_length']             # (B,)
 
         valid = (tlen > 0) & (ilen > 0)
-        if valid.sum().item() == 0:
+        if valid.sum() == 0:
             return None
 
         x = x[valid]
         ilen = ilen[valid]
 
-        # target の再構成（元の順序を保つ）
-        new_targets = []
-        new_tlens = []
+        new_targets, new_tlens = [], []
         off = 0
-        for i in range(tlen.numel()):
-            tl = int(tlen[i].item())
+        for i in range(len(tlen)):
+            tl = int(tlen[i])
             seg = y_cat[off:off + tl]
-            if bool(valid[i].item()) and tl > 0:
-                new_targets.append(seg)
+            if valid[i] and tl > 0:
+                new_targets.extend(seg.tolist())
                 new_tlens.append(tl)
             off += tl
 
-        if len(new_targets) == 0:
-            return None
-
-        y = torch.cat(new_targets, dim=0).long()
+        y = torch.tensor(new_targets, dtype=torch.long, device=self.device)
         tlen = torch.tensor(new_tlens, dtype=torch.long, device=self.device)
-        return x, y, ilen.long(), tlen
+        return x, y, ilen, tlen
 
     # ----------------------------
     # 学習・検証
@@ -435,35 +415,15 @@ class LipReadingTrainer:
 
     # 2. train_epoch() の返り値を修正
     def train_epoch(self, train_loader):
-        """1エポック学習（primary_lossで切替：CTC or SoftPER）
-        - SoftPER時：AMP無効 + fp32固定 + GradScaler不使用（重要）
-        - CTC時   ：AMP有効 + GradScaler使用（従来通り）
-        """
+        """1エポック学習（CTC+SoftPER / NaN対策込み）"""
         from tqdm import tqdm
 
         self.model.train()
-
-        total_primary = 0.0
-        total_ctc = 0.0
-        total_softper = 0.0
-        num_batches = 0
-
-        # loss モジュール（安全に取得）
-        primary_loss_fn = getattr(self, "primary_loss", None)
-        if primary_loss_fn is None:
-            raise RuntimeError("self.primary_loss が未設定です。__init__ で primary_loss を設定して。")
-
-        # 「CTCかSoftPERどっちか」前提：ログ用二重計算は基本しない
-        # ただしデバッグ目的で ctc_loss_fn を持っているなら参照だけは可能
-        ctc_loss_fn = getattr(self, "ctc_loss", None)
-        softper_loss_fn = getattr(self, "softper_loss", None)
+        total_loss, total_ctc, total_softper, num_batches = 0.0, 0.0, 0.0, 0
 
         pbar = tqdm(train_loader, desc="Training", leave=False)
 
-        # SoftPER時は AMP を切る（最重要）
-        use_amp = not bool(getattr(self, "use_softper", False))
-
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             flt = self._filter_valid_batch(batch)
             if flt is None:
                 continue
@@ -471,98 +431,66 @@ class LipReadingTrainer:
 
             self.optimizer.zero_grad(set_to_none=True)
 
-            # ========== forward ==========
-            with autocast(enabled=use_amp):
+            with autocast():
                 outputs = self.model(videos)
 
-                # (B,T,C) -> (T,B,C) log_probs
                 log_probs = (outputs if self.model_returns_log_probs
                             else torch.log_softmax(outputs, dim=-1)).permute(1, 0, 2)
 
-                # finite化
                 log_probs = torch.where(torch.isfinite(log_probs), log_probs, torch.zeros_like(log_probs))
 
-                # 長さ整合
                 Tcur = log_probs.size(0)
-                input_lengths = torch.clamp(input_lengths, min=1, max=Tcur)
+                input_lengths = torch.clamp(input_lengths, max=Tcur)
                 target_lengths = torch.clamp(target_lengths, min=1)
 
-            # SoftPER時は必ずfp32（AMP無効化しても念押し）
-            if not use_amp:  # = SoftPER
-                log_probs = log_probs.float()
+                ctc_loss = self.criterion(log_probs, targets, input_lengths, target_lengths)
 
-            # primary loss（これだけが学習に使われる）
-            loss = primary_loss_fn(log_probs, targets, input_lengths, target_lengths)
+                if self.use_softper:
+                    softper_loss = self.softper(log_probs, targets, input_lengths, target_lengths)
+                    loss = self.ctc_weight * ctc_loss + self.lambda_softper * softper_loss  # ← 修正
+                    
+                    if batch_idx == 0 and num_batches == 0:
+                        print(f"\n[DEBUG Train]")
+                        print(f"  CTC: {ctc_loss.item():.4f}")
+                        print(f"  SoftPER: {softper_loss.item():.4f}")
+                        print(f"  lambda: {self.lambda_softper}")
+                        print(f"  Combined: {loss.item():.4f}")
+                        print(f"  self.softper type: {type(self.softper)}")
+                        print(f"  self.use_softper: {self.use_softper}")
+                else:
+                    loss = ctc_loss
+                    softper_loss = torch.tensor(0.0)
 
-            if not torch.isfinite(loss):
-                continue
+                if not torch.isfinite(loss):
+                    continue
 
-            # ========== backward / step ==========
-            if not use_amp:
-                # SoftPER: scalerを使わない（重要）
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-            else:
-                # CTC: scaler使用
-                self.scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+            self.scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
-            # ========== logging ==========
-            total_primary += float(loss.item())
+            total_loss += float(loss.item())
+            total_ctc += float(ctc_loss.item())
+            total_softper += float(softper_loss.item()) if self.use_softper else 0.0
             num_batches += 1
 
-            # 「CTCかSoftPERどっちか」なので、ログは primary を対応する場所に入れる
-            if getattr(self, "use_softper", False):
-                total_softper += float(loss.item())
-            else:
-                total_ctc += float(loss.item())
+            avg_loss_so_far = total_loss / max(1, num_batches)
+            pbar.set_postfix({'loss': f'{avg_loss_so_far:.4f}'})
 
-            # 進捗表示
-            pbar.set_postfix({'loss': f'{(total_primary / max(1, num_batches)):.4f}'})
-
-            # 最初の1バッチだけ軽いデバッグ（必要なときだけ）
-            if num_batches == 1 and getattr(self, "use_softper", False):
-                # これ以上重くしないために “表示だけ”
-                with torch.no_grad():
-                    p0 = log_probs[0, 0].exp()  # (C,)
-                    topv, topi = torch.topk(p0, k=min(5, p0.numel()))
-                    print(f"\n[DEBUG SoftPER first batch]")
-                    print(f"  use_amp: {use_amp} (SoftPERならFalseが正しい)")
-                    print(f"  loss: {float(loss.item()):.6f}")
-                    print(f"  log_probs dtype: {log_probs.dtype} (SoftPERはfloat32が推奨)")
-                    print(f"  log_probs shape: {tuple(log_probs.shape)}")
-                    print(f"  target_lengths[:5]: {target_lengths[:5].tolist()}")
-                    print(f"  targets[:20]: {targets[:20].tolist()}")
-                    print(f"  topk probs(frame0,sample0): {list(zip(topi.tolist(), topv.tolist()))}")
-
-        avg_primary = total_primary / max(1, num_batches)
+        avg_loss = total_loss / max(1, num_batches)
         avg_ctc = total_ctc / max(1, num_batches)
         avg_softper = total_softper / max(1, num_batches)
-
-        # パラメータ更新チェック（あなたのやつを残す版：負荷ほぼ無し）
-        if not hasattr(self, '_initial_params'):
-            self._initial_params = {
-                name: param.clone().detach()
-                for name, param in self.model.named_parameters()
-                if param.requires_grad
-            }
-
-        print(f"\n[DEBUG param update check]")
-        changed = 0
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self._initial_params:
-                diff = (param - self._initial_params[name]).abs().max().item()
-                if diff > 1e-6:
-                    changed += 1
-                    if changed <= 3:
-                        print(f"  {name}: diff={diff:.6f}")
-
-        print(f"  Total changed params: {changed}/{len(self._initial_params)}")
-
-        return avg_primary, avg_ctc, avg_softper
+        
+        # ★ デバッグ追加
+        print(f"\n[DEBUG train_epoch] num_batches={num_batches}")
+        print(f"  avg_loss (Combined): {avg_loss:.4f}")
+        print(f"  avg_ctc:             {avg_ctc:.4f}")
+        print(f"  avg_softper:         {avg_softper:.4f}")
+        
+        if self.separate_softper_loss:
+            return avg_loss, avg_ctc, avg_softper
+        else:
+            return avg_loss
 
     
 
@@ -570,30 +498,14 @@ class LipReadingTrainer:
 
         # 3. validate() の返り値を修正
     def validate(self, val_loader):
-        """検証（primary_lossで切替：CTC or SoftPER）— 統一評価器 + 詳細分析つき"""
+        """検証（CTC+SoftPER）— 統一評価器を使用"""
         from tqdm import tqdm
 
         self.model.eval()
-
-        total_primary = 0.0
-        total_ctc = 0.0
-        total_softper = 0.0
-        num_batches = 0
-
+        total_loss = 0.0
+        total_ctc = 0.0      # ← 追加
+        total_softper = 0.0  # ← 追加
         all_predictions, all_targets = [], []
-
-        # loss モジュール（安全に取得）
-        primary_loss_fn = getattr(self, "primary_loss", None)
-        if primary_loss_fn is None:
-            raise RuntimeError("self.primary_loss が未設定です。__init__ で primary_loss を設定して。")
-
-        ctc_loss_fn = getattr(self, "ctc_loss", None)
-        if ctc_loss_fn is None:
-            ctc_loss_fn = getattr(self, "criterion", None)
-
-        softper_loss_fn = getattr(self, "softper_loss", None)
-        if softper_loss_fn is None:
-            softper_loss_fn = getattr(self, "softper", None)
 
         pbar = tqdm(val_loader, desc="Validation", leave=False)
 
@@ -605,14 +517,6 @@ class LipReadingTrainer:
                 x, y, ilen, tlen = flt
 
                 out = self.model(x)
-                # デバッグ追加
-                if not hasattr(self, "_model_output_checked"):
-                    print(f"\n[DEBUG model output]")
-                    print(f"  out.shape: {out.shape}")
-                    print(f"  out[0,0,:5]: {out[0,0,:5]}")
-                    print(f"  out.requires_grad: {out.requires_grad}")
-                    self._model_output_checked = True
-
                 logp = (out if self.model_returns_log_probs
                         else torch.log_softmax(out, dim=-1)).permute(1, 0, 2)
                 logp = torch.where(torch.isfinite(logp), logp, torch.zeros_like(logp))
@@ -621,103 +525,62 @@ class LipReadingTrainer:
                 ilen = torch.clamp(ilen, max=Tcur)
                 tlen = torch.clamp(tlen, min=1)
 
-                # --- primary loss（今回のモードの損失） ---
+                ctc_loss = self.criterion(logp, y, ilen, tlen)
+
                 if self.use_softper:
-                    logp = logp.float()
-                loss = primary_loss_fn(logp, y, ilen, tlen)
-                
-                # --- ログ用: CTC / SoftPER を別計算 ---
-                ctc_loss = None
-                if ctc_loss_fn is not None:
-                    ctc_loss = ctc_loss_fn(logp, y, ilen, tlen)
+                    softper_loss = self.softper(logp, y, ilen, tlen)
+                    loss = self.ctc_weight * ctc_loss + self.lambda_softper * softper_loss  # ← 修正
+                    print(f"[VAL Batch] ctc={ctc_loss.item():.4f}, softper={softper_loss.item():.4f}")  # デバッグ
+                else:
+                    loss = ctc_loss
+                    softper_loss = torch.tensor(0.0, device=self.device)  # ← device追加
 
-                softper_loss = None
-                if getattr(self, "use_softper", False) and (softper_loss_fn is not None):
-                    softper_loss = softper_loss_fn(logp, y, ilen, tlen)
+                total_loss += float(loss.item())
+                total_ctc += float(ctc_loss.item())
+                total_softper += float(softper_loss.item())  # if self.use_softper を削除してみる
 
-                total_primary += float(loss.item())
-                total_ctc += float(ctc_loss.item()) if ctc_loss is not None else 0.0
-                total_softper += float(softper_loss.item()) if softper_loss is not None else 0.0
-                num_batches += 1
-
-                # ---- decode ----
+                # デコード処理
                 use_beam = (self.decode_beam_width is not None
                             and self.decode_beam_width >= 2
                             and ctc_beam_search_decode is not None)
 
-                if not hasattr(self, "_decode_method_printed"):
-                    print(
-                        f"✓ Using {'BEAM SEARCH' if use_beam else 'GREEDY'} decode"
-                        f"{' (beam_width='+str(self.decode_beam_width)+')' if use_beam else ''}"
-                    )
+                if not hasattr(self, '_decode_method_printed'):
+                    print(f"✓ Using {'BEAM SEARCH' if use_beam else 'GREEDY'} decode"
+                        f"{' (beam_width='+str(self.decode_beam_width)+')' if use_beam else ''}")
                     self._decode_method_printed = True
 
                 if use_beam:
                     pred_ids = ctc_beam_search_decode(
-                        logp, self.phoneme_encoder.blank_id, ilen,
-                        beam_width=self.decode_beam_width
+                        logp, self.phoneme_encoder.blank_id, ilen, beam_width=self.decode_beam_width
                     )
                 else:
                     pred_ids = ctc_greedy_decode(logp, self.phoneme_encoder.blank_id, ilen)
 
-                    # ↓ ここに追加
-                    if not hasattr(self, '_decode_ids_checked'):
-                        print(f"\n[DEBUG decode IDs]")
-                        print(f"  blank_id: {self.phoneme_encoder.blank_id}")
-                        for i in range(min(5, len(pred_ids))):
-                            print(f"  pred_ids[{i}]: {pred_ids[i]}")
-                        
-                        # argmax確認
-                        max_ids = torch.argmax(logp, dim=2)  # (T,B)
-                        print(f"  argmax sample 0: {max_ids[:20, 0].tolist()}")
-                        self._decode_ids_checked = True
-                        
-                        # blank率を確認
-                        blank_id = self.phoneme_encoder.blank_id
-                        total_frames = logp.size(0) * logp.size(1)
-                        blank_frames = (torch.argmax(logp, dim=2) == blank_id).sum().item()
-                        print(f"  Blank rate: {blank_frames/total_frames*100:.2f}%")
-                        
-                        # 各クラスの出現確率
-                        max_probs = torch.exp(logp).max(dim=2)[0].mean().item()
-                        print(f"  Avg max prob: {max_probs:.4f}")
-                        
-                        self._output_diversity_checked = True
+
+                    if len(all_predictions) == 0:
+                        print(f"\n[DEBUG ctc_greedy_decode詳細]")
+                        print(f"  max_ids[0,:5] = {logp.argmax(dim=-1)[0,:5]}")  # 最初5フレーム
+                        print(f"  blank以外の出現: {(logp.argmax(dim=-1) != 0).sum().item()} / {logp.shape[0] * logp.shape[1]}")
 
                 preds = ids_to_phonemes(pred_ids, self.phoneme_encoder)
 
-                # デバッグ追加
-                if not hasattr(self, "_decode_debug_printed"):
-                    print(f"\n[DEBUG decode sample]")
-                    print(f"  pred_ids[0]: {pred_ids[0][:10]}")
-                    print(f"  preds[0]: {preds[0][:10]}")
-                    print(f"  blank_id: {self.phoneme_encoder.blank_id}")
-                    self._decode_debug_printed = True
-
-                # target 展開
                 off = 0
                 for tl in tlen.tolist():
                     ids = y[off:off + tl].detach().cpu().tolist()
                     all_targets.append(self.phoneme_encoder.decode_phonemes(ids))
                     off += tl
+
+                if len(all_predictions) < 3:  # 最初の3バッチだけ
+                    print(f"\n[DEBUG] Batch predictions:")
+                    print(f"  pred_ids[:3]: {pred_ids[:3]}")
+                    print(f"  preds[:3]: {preds[:3]}")
+                    print(f"  targets[:3]: {all_targets[:min(3, len(all_targets))]}")
+
                 all_predictions.extend(preds)
 
-                pbar.set_postfix({"samples": len(all_predictions)})
+                pbar.set_postfix({'samples': len(all_predictions)})
 
-        # ---- 予測のざっくり分析 ----
-        print(f"\n{'='*70}")
-        print("Prediction Analysis")
-        print(f"{'='*70}")
-        print(f"Total predictions: {len(all_predictions)}")
-        print(f"Empty predictions: {sum(1 for p in all_predictions if len(p) == 0)}")
-        print(f"Non-empty predictions: {sum(1 for p in all_predictions if len(p) > 0)}")
-        if len(all_predictions) > 0:
-            print("Sample predictions (first 5):")
-            for i in range(min(5, len(all_predictions))):
-                print(f"  {i}: pred={all_predictions[i][:10]}, target={all_targets[i][:10]}")
-        print(f"{'='*70}\n")
-
-        # ---- 詳細: S/D/I と length bucket ----
+        # メトリクス計算（既存コード省略）
         sample_results = []
         global_S = global_D = global_I = 0
         len_refs, len_hyps = [], []
@@ -728,10 +591,10 @@ class LipReadingTrainer:
             per_ref = 100.0 * (S + D + I) / max(1, Nref)
             if per_ref > 0.0:
                 sample_results.append({
-                    "per_ref": round(per_ref, 2),
-                    "S": S, "D": D, "I": I,
-                    "len_ref": Nref, "len_hyp": Nhyp,
-                    "predicted": p, "target": t
+                    'per_ref': round(per_ref, 2),
+                    'S': S, 'D': D, 'I': I,
+                    'len_ref': Nref, 'len_hyp': Nhyp,
+                    'predicted': p, 'target': t
                 })
             global_S += S
             global_D += D
@@ -740,36 +603,17 @@ class LipReadingTrainer:
             len_refs.append(Nref)
             len_hyps.append(Nhyp)
 
-        sample_results.sort(key=lambda x: -x["per_ref"])
+        sample_results.sort(key=lambda x: -x['per_ref'])
 
         metrics = self.evaluator.calculate_all_metrics(all_predictions, all_targets)
-        metrics["sample_results"] = sample_results[:10]
-        metrics["global_S"] = global_S
-        metrics["global_D"] = global_D
-        metrics["global_I"] = global_I
-        metrics["avg_len_ref"] = float(np.mean(len_refs)) if len_refs else 0.0
-        metrics["avg_len_hyp"] = float(np.mean(len_hyps)) if len_hyps else 0.0
-        metrics["avg_edit_distance"] = (total_edit_dist / max(1, len(all_predictions))) if all_predictions else 0.0
-
-        print(f"\n[DEBUG validate - CRITICAL]")
-        print(f"  total predictions: {len(all_predictions)}")
-        print(f"  total targets: {len(all_targets)}")
-        print(f"  empty predictions: {sum(1 for p in all_predictions if len(p)==0)}")
-        print(f"  sample pred[0]: {all_predictions[0] if all_predictions else 'NONE'}")
-        print(f"  sample tgt[0]: {all_targets[0] if all_targets else 'NONE'}")
-        print(f"  pred unique: {len(set(tuple(p) for p in all_predictions[:100]))}")
-        print(f"  PER from metrics: {metrics.get('per_per', 'NONE')}")
-        print(f"  global_S/D/I: {global_S}/{global_D}/{global_I}")
-        print(f"  sum(len_refs): {sum(len_refs)}")
-
-        # train.py の validate() 内、metrics 計算後に追加
-        print("\n[DEBUG train.py] 詳細内訳:")
-        print(f"  global_S: {global_S}")
-        print(f"  global_D: {global_D}")
-        print(f"  global_I: {global_I}")
-        print(f"  総誤り数: {global_S + global_D + global_I}")
-        print(f"  総系列長: {sum(len_refs)}")
-        print(f"  PER計算: {(global_S + global_D + global_I) / sum(len_refs) * 100:.4f}%")
+        metrics['sample_results'] = sample_results[:10]
+        metrics['global_S'] = global_S
+        metrics['global_D'] = global_D
+        metrics['global_I'] = global_I
+        metrics['avg_len_ref'] = float(np.mean(len_refs)) if len_refs else 0.0
+        metrics['avg_len_hyp'] = float(np.mean(len_hyps)) if len_hyps else 0.0
+        avg_edit_dist = total_edit_dist / max(1, len(all_predictions))
+        metrics['avg_edit_distance'] = avg_edit_dist
 
         bins = [(1, 1), (2, 3), (4, 6), (7, 10), (11, 20), (21, 999)]
         bin_map = {}
@@ -784,25 +628,28 @@ class LipReadingTrainer:
                     total_len += len(t)
             per_bin = 100.0 * (S + D + I) / max(1, total_len)
             bin_map[f"{lo}-{hi}"] = per_bin
-        metrics["length_bucket_per"] = bin_map
+        metrics['length_bucket_per'] = bin_map
 
-        # validate 結果を保存
         self.last_val_predictions = all_predictions
         self.last_val_targets = all_targets
 
-        # ---- 平均 loss（ここが壊れてたので修正）----
-        denom = max(1, num_batches)
-        avg_val_loss = total_primary / denom
-        avg_val_ctc = total_ctc / denom
-        avg_val_softper = total_softper / denom
+        # SoftPER分離
+        num_batches = max(1, len(val_loader))
+        avg_val_loss = total_loss / num_batches
+        avg_val_ctc = total_ctc / num_batches
+        avg_val_softper = total_softper / num_batches
 
+        
+        # ★ デバッグ追加
         print(f"\n[DEBUG validate] num_batches={num_batches}")
-        print(f"  avg_val_loss (PRIMARY): {avg_val_loss:.4f}")
-        print(f"  avg_val_ctc:            {avg_val_ctc:.4f}")
-        print(f"  avg_val_softper:        {avg_val_softper:.4f}")
-
-        # 返り値は train() 側の受け取りに合わせて固定（分岐させない方が安全）
-        return avg_val_loss, avg_val_ctc, avg_val_softper, metrics
+        print(f"  avg_val_loss (Combined): {avg_val_loss:.4f}")
+        print(f"  avg_val_ctc:             {avg_val_ctc:.4f}")
+        print(f"  avg_val_softper:         {avg_val_softper:.4f}")
+        
+        if self.separate_softper_loss:
+            return avg_val_loss, avg_val_ctc, avg_val_softper, metrics
+        else:
+            return avg_val_loss, metrics
 
     # ----------------------------
     # train
@@ -831,7 +678,6 @@ class LipReadingTrainer:
 
         try:
             for epoch in range(1, epochs + 1):
-                current_epoch = epoch
                 epoch_start = time.time()
                 self.apply_gradual_unfreezing(epoch)
 
@@ -849,6 +695,8 @@ class LipReadingTrainer:
                         self.scheduler.step()
 
                 current_lr = self.optimizer.param_groups[0]['lr']
+                self.history.setdefault('lr', []).append(float(self.optimizer.param_groups[0]['lr']))
+
                 epoch_time = time.time() - epoch_start
                 cumulative_time = time.time() - start_time
 
@@ -1150,12 +998,11 @@ class LipReadingTrainer:
                 except Exception as e:
                     print(f"⚠️  Failed to save training plot: {e}")
 
-                # ★ 追加：LR only のグラフ保存
-                lr_plot_path = os.path.join(self.result_dir, 'lr_history.png')
                 try:
-                    self.plot_lr_only(save_path=lr_plot_path)
+                    os.makedirs(self.result_dir, exist_ok=True)
+                    self.plot_lr_only(save_path=os.path.join(self.result_dir, "lr_history.png"))
                 except Exception as e:
-                    print(f"⚠️  Failed to save lr plot: {e}")
+                    print(f"⚠️ lr plot failed: {e}")
 
         return self.history
 
@@ -1191,7 +1038,6 @@ class LipReadingTrainer:
         Training history plot (1 figure, 2 panels side-by-side)
         - Left : Loss (Train / Val)
         - Right: PER [%]
-        - No LR plot
         """
         if len(self.history.get('train_loss', [])) == 0:
             print("⚠ history が空なので plot をスキップします")
@@ -1201,47 +1047,35 @@ class LipReadingTrainer:
 
         fig, (ax_loss, ax_per) = plt.subplots(1, 2, figsize=(14, 5))
 
-        # ===== Left: Loss =====
-        ax_loss.plot(
-            epochs, self.history['train_loss'],
-            label='Train Loss', color='tab:blue', linewidth=2
-        )
-        ax_loss.plot(
-            epochs, self.history['val_loss'],
-            label='Val Loss', color='tab:orange', linestyle='--', linewidth=2
-        )
+        ax_loss.plot(epochs, self.history['train_loss'], label='Train Loss', linewidth=2)
+        ax_loss.plot(epochs, self.history['val_loss'], label='Val Loss', linestyle='--', linewidth=2)
         ax_loss.set_title('Loss', fontweight='bold', fontsize=13)
         ax_loss.set_xlabel('Epoch', fontsize=11)
         ax_loss.set_ylabel('Loss', fontsize=11)
         ax_loss.grid(True, alpha=0.3)
         ax_loss.legend(loc='best')
 
-        # ===== Right: PER =====
         per_hist = self.history.get('per_percent', [])
         if len(per_hist) > 0:
-            ax_per.plot(
-                epochs, per_hist,
-                label='Val PER (%)', color='tab:red', linewidth=2
-            )
+            ax_per.plot(epochs, per_hist, label='Val PER (%)', linewidth=2)
         ax_per.set_title('PER [%]', fontweight='bold', fontsize=13)
         ax_per.set_xlabel('Epoch', fontsize=11)
         ax_per.set_ylabel('PER [%]', fontsize=11)
         ax_per.grid(True, alpha=0.3)
         ax_per.legend(loc='best')
 
-        loss_name = "SoftPER" if getattr(self, "use_softper", False) else "CTC"
-        fig.suptitle(f"Training History ({loss_name})", fontsize=14, fontweight='bold')
-
+        fig.suptitle(f"Training History (CTC{'+SoftPER' if getattr(self,'use_softper',False) else ''})",
+                    fontsize=14, fontweight='bold')
         plt.tight_layout()
 
         if save_path is not None:
             plt.savefig(save_path, dpi=200, bbox_inches='tight')
             print(f"✓ Training history saved: {save_path}")
-
         plt.close()
 
+
     def plot_lr_only(self, save_path=None):
-        """Learning rate only plot (1 figure)"""
+        """Learning rate only plot (optional utility)"""
         lr_hist = self.history.get('lr', [])
         if len(lr_hist) == 0:
             print("⚠ lr history が空なので lr plot をスキップします")
@@ -1255,16 +1089,11 @@ class LipReadingTrainer:
         plt.xlabel("Epoch", fontsize=11)
         plt.ylabel("Learning Rate", fontsize=11)
         plt.grid(True, alpha=0.3)
-
-        # 値が小さいと見やすいようにlogにしたければ↓をON（好み）
-        # plt.yscale('log')
-
         plt.tight_layout()
 
         if save_path is not None:
             plt.savefig(save_path, dpi=200, bbox_inches='tight')
             print(f"✓ LR history saved: {save_path}")
-
         plt.close()
 
 
@@ -1398,15 +1227,6 @@ def evaluate_model(model, data_loader, phoneme_encoder, device,
     metrics['global_I'] = global_I
     metrics['avg_len_ref'] = float(np.mean(len_refs)) if len_refs else 0.0
     metrics['avg_len_hyp'] = float(np.mean(len_hyps)) if len_hyps else 0.0
-
-    # train.py の validate() 内、metrics 計算後に追加
-    print("\n[DEBUG train.py] 詳細内訳:EVAL")
-    print(f"  global_S: {global_S}")
-    print(f"  global_D: {global_D}")
-    print(f"  global_I: {global_I}")
-    print(f"  総誤り数: {global_S + global_D + global_I}")
-    print(f"  総系列長: {sum(len_refs)}")
-    print(f"  PER計算: {(global_S + global_D + global_I) / sum(len_refs) * 100:.4f}%")
 
     bins = [(1, 1), (2, 3), (4, 6), (7, 10), (11, 20), (21, 999)]
     bin_map = {}
